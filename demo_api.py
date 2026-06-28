@@ -16,362 +16,429 @@ Deploy to Render.com:
   Start command: uvicorn demo_api:app --host 0.0.0.0 --port $PORT
 """
 
-import os, time, threading, asyncio, json
+import os, time, threading
 import numpy as np
 from collections import deque
 from datetime import datetime
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import uvicorn
+import uvicorn, requests as req
 from stable_baselines3 import PPO
 
-# ── APP SETUP ─────────────────────────────────────────────────────────────────
-app = FastAPI(title="Crypto DRL Agent Demo API", version="2.0")
+# ── APP ────────────────────────────────────────────────────────────────────────
+app = FastAPI(title="Crypto RL Agent API", version="3.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
 )
 
-# ── CONFIG ────────────────────────────────────────────────────────────────────
+# ── CONFIG ─────────────────────────────────────────────────────────────────────
 MODEL_PATH      = "best_model.zip"
 OBS_WINDOW      = 60
 INITIAL_BALANCE = 10_000.0
 ORDER_SIZE_USD  = 100.0
 FEE_RATE        = 0.0004
-INFERENCE_EVERY = 5
+POLL_EVERY      = 5          # seconds between REST polls
 EPS             = 1e-9
 
-# ── SHARED STATE ──────────────────────────────────────────────────────────────
+# Binance Futures public REST (no auth needed)
+BINANCE_BASE    = "https://fapi.binance.com/fapi/v1"
+SYMBOL          = "BTCUSDT"
+
+# ── SHARED STATE ───────────────────────────────────────────────────────────────
 portfolio = {
-    "balance": INITIAL_BALANCE, "position": 0, "entry_price": 0.0,
-    "realized_pnl": 0.0, "unrealized_pnl": 0.0,
-    "trades": [], "equity_history": [INITIAL_BALANCE],
-    "action_history": [], "last_action": "HOLD",
-    "last_price": 0.0, "bars_since_trade": 0,
-    "agent_signal": "HOLD", "agent_confidence": 0.0,
-    "manual_mode": False,
+    "balance":         INITIAL_BALANCE,
+    "position":        0,
+    "entry_price":     0.0,
+    "realized_pnl":    0.0,
+    "unrealized_pnl":  0.0,
+    "trades":          [],
+    "equity_history":  [INITIAL_BALANCE],
+    "action_history":  [],
+    "last_action":     "HOLD",
+    "last_price":      0.0,
+    "agent_signal":    "HOLD",
+    "manual_mode":     False,
+    "bars_since_trade":0,
 }
 
 feature_buffer = deque(maxlen=OBS_WINDOW + 10)
-lob_buffer     = deque(maxlen=50)
-trade_buffer   = deque(maxlen=200)
-price_history  = deque(maxlen=500)   # for candlestick
-ohlcv_bars     = deque(maxlen=200)   # 5-second OHLCV bars
-_bar_prices    = []
-_bar_start     = time.time()
+ohlcv_bars     = deque(maxlen=200)
+prev_lob       = None          # previous bookTicker for OFI delta
+lob_history    = deque(maxlen=30)
+model          = None
+_running       = False
 
-model = None
 
-# ── MODEL LOAD ────────────────────────────────────────────────────────────────
+# ── MODEL LOAD ─────────────────────────────────────────────────────────────────
 @app.on_event("startup")
-def load_model():
+def startup():
     global model
     if os.path.exists(MODEL_PATH):
         model = PPO.load(MODEL_PATH)
-        print(f"[API] Model loaded: {MODEL_PATH}")
+        print(f"[API] Model loaded ✓")
     else:
         print(f"[API] WARNING: {MODEL_PATH} not found")
+    # Start background polling thread here — NOT in __main__
+    # This is the critical fix: Render runs uvicorn directly so __main__
+    # never executes. startup() always runs regardless.
+    t = threading.Thread(target=_poll_loop, daemon=True)
+    t.start()
+    print("[API] Background polling thread started ✓")
 
-# ── FEATURE COMPUTATION ───────────────────────────────────────────────────────
-def compute_features(price, prev_price, bid_p, bid_q, ask_p, ask_q, buy_vol, sell_vol):
-    log_ret    = float(np.log(price / max(prev_price, EPS)))
-    spread     = ask_p - bid_p
-    mid_price  = (bid_p + ask_p) / 2.0
-    rel_spread = spread / max(mid_price, EPS)
-    depth_imb  = (bid_q - ask_q) / max(bid_q + ask_q, EPS)
-    tfi        = (buy_vol - sell_vol) / max(buy_vol + sell_vol, EPS)
+
+# ── REST POLLING ───────────────────────────────────────────────────────────────
+
+def _fetch_price():
+    """Fetch current mark price via REST."""
+    try:
+        r = req.get(f"{BINANCE_BASE}/ticker/price",
+                    params={"symbol": SYMBOL}, timeout=4)
+        return float(r.json()["price"])
+    except Exception:
+        return None
+
+def _fetch_book():
+    """Fetch best bid/ask via REST bookTicker endpoint."""
+    try:
+        r = req.get(f"{BINANCE_BASE}/ticker/bookTicker",
+                    params={"symbol": SYMBOL}, timeout=4)
+        d = r.json()
+        return {
+            "bid_price": float(d["bidPrice"]),
+            "bid_qty":   float(d["bidQty"]),
+            "ask_price": float(d["askPrice"]),
+            "ask_qty":   float(d["askQty"]),
+        }
+    except Exception:
+        return None
+
+def _fetch_recent_trades():
+    """Fetch last 50 aggregate trades to compute buy/sell volume."""
+    try:
+        r = req.get(f"{BINANCE_BASE}/aggTrades",
+                    params={"symbol": SYMBOL, "limit": 50}, timeout=4)
+        trades = r.json()
+        buy_vol  = sum(float(t["q"]) for t in trades if not t["m"])
+        sell_vol = sum(float(t["q"]) for t in trades if t["m"])
+        return buy_vol, sell_vol
+    except Exception:
+        return 0.0, 0.0
+
+
+# ── FEATURE COMPUTATION ────────────────────────────────────────────────────────
+
+def _compute_ofi(current_lob, prev_lob_snap):
+    """OFI from two consecutive REST bookTicker snapshots."""
+    if prev_lob_snap is None:
+        return 0.0
+    e_bid = 0.0
+    if current_lob["bid_price"] > prev_lob_snap["bid_price"]:
+        e_bid = current_lob["bid_qty"]
+    elif current_lob["bid_price"] == prev_lob_snap["bid_price"]:
+        e_bid = (current_lob["bid_qty"]
+                 if current_lob["bid_qty"] > prev_lob_snap["bid_qty"]
+                 else -prev_lob_snap["bid_qty"])
+    else:
+        e_bid = -current_lob["bid_qty"]
+
+    e_ask = 0.0
+    if current_lob["ask_price"] < prev_lob_snap["ask_price"]:
+        e_ask = -current_lob["ask_qty"]
+    elif current_lob["ask_price"] == prev_lob_snap["ask_price"]:
+        e_ask = (-current_lob["ask_qty"]
+                 if current_lob["ask_qty"] < prev_lob_snap["ask_qty"]
+                 else prev_lob_snap["ask_qty"])
+    else:
+        e_ask = current_lob["ask_qty"]
+
+    ofi = e_bid - e_ask
+    total_depth = (current_lob["bid_qty"] + current_lob["ask_qty"] +
+                   prev_lob_snap["bid_qty"] + prev_lob_snap["ask_qty"])
+    return float(np.clip(ofi / max(total_depth, EPS), -1.0, 1.0))
+
+def _compute_bar(price, prev_price, lob, buy_vol, sell_vol):
+    """Compute all 8 microstructure features for one 5-second bar."""
     buf        = list(feature_buffer)
-    vol_roll   = float(np.std([b["log_ret"] for b in buf[-20:]] + [log_ret])) if len(buf) > 2 else 0.0
+    log_ret    = float(np.log(price / max(prev_price, EPS)))
+    spread     = lob["ask_price"] - lob["bid_price"]
+    mid        = (lob["bid_price"] + lob["ask_price"]) / 2.0
+    rel_spread = spread / max(mid, EPS)
+    depth_imb  = ((lob["bid_qty"] - lob["ask_qty"]) /
+                  max(lob["bid_qty"] + lob["ask_qty"], EPS))
+    tfi        = (buy_vol - sell_vol) / max(buy_vol + sell_vol, EPS)
+    vol_roll   = (float(np.std([b["log_ret"] for b in buf[-20:]] + [log_ret]))
+                  if len(buf) > 2 else 0.0)
     prices     = [b["price"] for b in buf[-20:]] + [price]
-    ret_5      = float(np.log(prices[-1] / max(prices[-6],  EPS))) if len(prices) >= 6  else 0.0
-    ret_20     = float(np.log(prices[-1] / max(prices[-21], EPS))) if len(prices) >= 21 else 0.0
-    vwap       = float(np.mean(prices[-100:])) if prices else price
+    ret_5      = (float(np.log(prices[-1] / max(prices[-6],  EPS)))
+                  if len(prices) >= 6  else 0.0)
+    ret_20     = (float(np.log(prices[-1] / max(prices[-21], EPS)))
+                  if len(prices) >= 21 else 0.0)
+    vwap       = float(np.mean([b["price"] for b in buf[-100:]] + [price]))
     pvwap      = (price - vwap) / max(vwap, EPS)
-    ofi_norm   = 0.0
-    if len(lob_buffer) > 1:
-        lobs  = list(lob_buffer)[-20:]
-        ofi   = sum((lobs[i]["bid_qty"] - lobs[i-1]["bid_qty"]) -
-                    (lobs[i]["ask_qty"] - lobs[i-1]["ask_qty"])
-                    for i in range(1, len(lobs)))
-        depth = sum(l["bid_qty"] + l["ask_qty"] for l in lobs)
-        ofi_norm = ofi / max(depth, EPS)
+    ofi_norm   = _compute_ofi(lob, prev_lob)
     return {
-        "price": price, "log_ret": log_ret, "tfi": tfi,
-        "ofi_norm": min(1.0, max(-1.0, ofi_norm)),
+        "price": price, "log_ret": log_ret,
+        "tfi": tfi, "ofi_norm": ofi_norm,
         "vol_rolling": vol_roll, "rel_spread": rel_spread,
         "depth_imb": depth_imb, "ret_5": ret_5,
         "ret_20": ret_20, "price_vs_vwap": pvwap,
     }
 
-def build_observation():
+def _build_obs():
     if len(feature_buffer) < OBS_WINDOW:
         return None
     window    = list(feature_buffer)[-OBS_WINDOW:]
     feat_cols = ["tfi","ofi_norm","vol_rolling","rel_spread",
                  "depth_imb","ret_5","ret_20","price_vs_vwap"]
     mkt  = np.array([[b[c] for c in feat_cols] for b in window], dtype=np.float32)
-    port = np.full((OBS_WINDOW, 3),
-                   [float(portfolio["position"]),
-                    float(portfolio["unrealized_pnl"] / INITIAL_BALANCE), 0.0],
-                   dtype=np.float32)
+    port = np.full(
+        (OBS_WINDOW, 3),
+        [float(portfolio["position"]),
+         float(portfolio["unrealized_pnl"] / INITIAL_BALANCE),
+         0.0],
+        dtype=np.float32,
+    )
     return np.concatenate([mkt, port], axis=1).flatten()
 
-# ── TRADE EXECUTION ───────────────────────────────────────────────────────────
-def _close_position(price, label, source="agent"):
+
+# ── TRADE HELPERS ──────────────────────────────────────────────────────────────
+
+def _close(price, label, source="agent"):
     if portfolio["position"] == 0:
         return
     btc = ORDER_SIZE_USD / portfolio["entry_price"]
-    pnl = ((price - portfolio["entry_price"]) * btc if portfolio["position"] == 1
+    pnl = ((price - portfolio["entry_price"]) * btc
+           if portfolio["position"] == 1
            else (portfolio["entry_price"] - price) * btc)
     pnl -= FEE_RATE * ORDER_SIZE_USD
-    portfolio["realized_pnl"] += pnl
+    portfolio["realized_pnl"]  += pnl
     portfolio["unrealized_pnl"] = 0.0
     portfolio["trades"].append({
-        "time":   datetime.utcnow().strftime("%H:%M:%S"),
-        "type":   label, "source": source,
-        "price":  round(price, 2),
-        "pnl":    round(pnl, 4),
+        "time":     datetime.utcnow().strftime("%H:%M:%S"),
+        "type":     label, "source": source,
+        "price":    round(price, 2),
+        "pnl":      round(pnl, 4),
         "position": portfolio["position"],
     })
-    portfolio["position"] = 0
+    portfolio["position"]    = 0
     portfolio["entry_price"] = 0.0
-    portfolio["bars_since_trade"] = 0
 
-def _open_position(price, direction, source="agent"):
-    portfolio["position"]    = direction
-    portfolio["entry_price"] = price
+def _open(price, direction, source="agent"):
+    portfolio["position"]     = direction
+    portfolio["entry_price"]  = price
     portfolio["realized_pnl"] -= FEE_RATE * ORDER_SIZE_USD
     portfolio["trades"].append({
-        "time":   datetime.utcnow().strftime("%H:%M:%S"),
-        "type":   "BUY" if direction == 1 else "SELL",
-        "source": source,
-        "price":  round(price, 2),
-        "pnl":    0,
+        "time":     datetime.utcnow().strftime("%H:%M:%S"),
+        "type":     "BUY" if direction == 1 else "SELL",
+        "source":   source,
+        "price":    round(price, 2),
+        "pnl":      0,
         "position": direction,
     })
 
-def update_unrealized(price):
-    if portfolio["position"] == 1:
-        btc = ORDER_SIZE_USD / portfolio["entry_price"]
-        portfolio["unrealized_pnl"] = (price - portfolio["entry_price"]) * btc
-    elif portfolio["position"] == -1:
-        btc = ORDER_SIZE_USD / portfolio["entry_price"]
-        portfolio["unrealized_pnl"] = (portfolio["entry_price"] - price) * btc
-    else:
+def _update_unrealized(price):
+    if portfolio["position"] == 0:
         portfolio["unrealized_pnl"] = 0.0
+    else:
+        btc = ORDER_SIZE_USD / portfolio["entry_price"]
+        portfolio["unrealized_pnl"] = (
+            (price - portfolio["entry_price"]) * btc
+            if portfolio["position"] == 1
+            else (portfolio["entry_price"] - price) * btc
+        )
 
-# ── WEBSOCKET ──────────────────────────────────────────────────────────────────
-def start_websocket():
-    async def _run():
-        import websockets
-        uri = "wss://stream.binancefuture.com/stream?streams=btcusdt@bookTicker/btcusdt@aggTrade"
-        while True:
-            try:
-                async with websockets.connect(uri) as ws:
-                    print("[WS] Connected")
-                    async for msg in ws:
-                        d = json.loads(msg)
-                        stream = d.get("stream", "")
-                        data   = d.get("data", {})
-                        if "bookTicker" in stream:
-                            lob_buffer.append({
-                                "bid_price": float(data.get("b", 0)),
-                                "bid_qty":   float(data.get("B", 0)),
-                                "ask_price": float(data.get("a", 0)),
-                                "ask_qty":   float(data.get("A", 0)),
-                            })
-                        elif "aggTrade" in stream:
-                            trade_buffer.append({
-                                "qty":     float(data.get("q", 0)),
-                                "is_sell": bool(data.get("m", False)),
-                                "price":   float(data.get("p", 0)),
-                            })
-            except Exception as e:
-                print(f"[WS] Error: {e} — reconnecting in 3s")
-                await asyncio.sleep(3)
-    asyncio.run(_run())
 
-# ── INFERENCE LOOP ────────────────────────────────────────────────────────────
-def inference_loop():
-    import requests as req
-    global _bar_prices, _bar_start
+# ── MAIN POLLING LOOP ──────────────────────────────────────────────────────────
+
+def _poll_loop():
+    """
+    Runs every POLL_EVERY seconds in a background thread.
+    Fetches price + bookTicker + recent trades via REST,
+    computes features, and runs agent inference.
+    Started by startup() — always runs on Render.
+    """
+    global prev_lob
     prev_price = None
+    bar_prices = []
+    bar_start  = time.time()
+
+    print("[POLL] Loop started")
 
     while True:
-        time.sleep(INFERENCE_EVERY)
+        time.sleep(POLL_EVERY)
         try:
-            r     = req.get("https://fapi.binance.com/fapi/v1/ticker/price",
-                            params={"symbol": "BTCUSDT"}, timeout=5)
-            price = float(r.json()["price"])
-            price_history.append({"price": price, "ts": time.time()})
-            _bar_prices.append(price)
+            price    = _fetch_price()
+            lob      = _fetch_book()
+            buy_vol, sell_vol = _fetch_recent_trades()
 
-            # Build OHLCV bar every 5 seconds
-            if _bar_prices:
-                ohlcv_bars.append({
-                    "time":  datetime.utcnow().strftime("%H:%M:%S"),
-                    "open":  _bar_prices[0],
-                    "high":  max(_bar_prices),
-                    "low":   min(_bar_prices),
-                    "close": _bar_prices[-1],
-                    "vol":   len(_bar_prices),
-                })
-                _bar_prices = []
-
-            if prev_price is None:
-                prev_price = price
+            if price is None or lob is None:
+                print("[POLL] Fetch failed — retrying next cycle")
                 continue
 
-            recent   = list(trade_buffer)
-            buy_vol  = sum(t["qty"] for t in recent if not t["is_sell"])
-            sell_vol = sum(t["qty"] for t in recent if t["is_sell"])
-            trade_buffer.clear()
+            bar_prices.append(price)
 
-            lob = list(lob_buffer)[-1] if lob_buffer else {
-                "bid_price": price*0.9999, "bid_qty": 1.0,
-                "ask_price": price*1.0001, "ask_qty": 1.0,
-            }
+            # Build OHLCV bar every POLL_EVERY seconds
+            ohlcv_bars.append({
+                "time":  datetime.utcnow().strftime("%H:%M:%S"),
+                "open":  bar_prices[0] if bar_prices else price,
+                "high":  max(bar_prices) if bar_prices else price,
+                "low":   min(bar_prices) if bar_prices else price,
+                "close": price,
+                "vol":   len(bar_prices),
+            })
+            bar_prices = []
 
-            bar = compute_features(price, prev_price,
-                                   lob["bid_price"], lob["bid_qty"],
-                                   lob["ask_price"], lob["ask_qty"],
-                                   buy_vol, sell_vol)
+            # Skip first iteration — need prev_price for log return
+            if prev_price is None:
+                prev_price = price
+                prev_lob   = lob
+                print(f"[POLL] First price: {price:.2f} — warming up...")
+                continue
+
+            # Compute features and add to buffer
+            bar = _compute_bar(price, prev_price, lob, buy_vol, sell_vol)
             feature_buffer.append(bar)
+            lob_history.append(lob)
             prev_price = price
+            prev_lob   = lob
 
-            update_unrealized(price)
+            n_buf = len(feature_buffer)
+            print(f"[POLL] price={price:.2f}  bars={n_buf}/{OBS_WINDOW}  "
+                  f"tfi={bar['tfi']:+.3f}  ofi={bar['ofi_norm']:+.3f}")
+
+            # Update portfolio
+            _update_unrealized(price)
             portfolio["last_price"] = price
-            portfolio["bars_since_trade"] += 1
-
-            equity = INITIAL_BALANCE + portfolio["realized_pnl"] + portfolio["unrealized_pnl"]
+            equity = (INITIAL_BALANCE
+                      + portfolio["realized_pnl"]
+                      + portfolio["unrealized_pnl"])
             portfolio["equity_history"].append(round(equity, 4))
 
-            # ── Get agent signal ────────────────────────────────────────────
-            obs = build_observation()
-            if obs is not None and model is not None:
-                action, _ = model.predict(obs[np.newaxis, :], deterministic=True)
-                action = int(action)
-                names  = {0:"HOLD", 1:"BUY", 2:"SELL"}
-                portfolio["agent_signal"] = names[action]
+            # Agent inference — only when buffer is full
+            if n_buf < OBS_WINDOW or model is None:
+                continue
 
-                # Execute if not in manual mode
-                if not portfolio["manual_mode"]:
-                    if action == 1 and portfolio["position"] <= 0:
-                        if portfolio["position"] == -1:
-                            _close_position(price, "CLOSE_SHORT", source="agent")
-                        _open_position(price, 1, source="agent")
-                    elif action == 2 and portfolio["position"] >= 0:
-                        if portfolio["position"] == 1:
-                            _close_position(price, "CLOSE_LONG", source="agent")
-                        _open_position(price, -1, source="agent")
-                    portfolio["last_action"] = names[action]
+            obs    = _build_obs()
+            if obs is None:
+                continue
 
-                portfolio["action_history"].append({
-                    "time":   datetime.utcnow().strftime("%H:%M:%S"),
-                    "action": names[action],
-                    "price":  round(price, 2),
-                    "source": "manual" if portfolio["manual_mode"] else "agent",
-                    "tfi":    round(bar["tfi"], 4),
-                    "ofi":    round(bar["ofi_norm"], 4),
-                })
+            action, _ = model.predict(obs[np.newaxis, :], deterministic=True)
+            action    = int(action)
+            names     = {0:"HOLD", 1:"BUY", 2:"SELL"}
+            portfolio["agent_signal"] = names[action]
 
-            print(f"  [{datetime.utcnow().strftime('%H:%M:%S')}]  "
-                  f"price={price:.2f}  signal={portfolio['agent_signal']}  "
-                  f"pos={portfolio['position']}  equity={equity:.2f}")
+            # Execute if in agent-auto mode
+            if not portfolio["manual_mode"]:
+                if action == 1 and portfolio["position"] <= 0:
+                    if portfolio["position"] == -1:
+                        _close(price, "CLOSE_SHORT", source="agent")
+                    _open(price, 1, source="agent")
+                elif action == 2 and portfolio["position"] >= 0:
+                    if portfolio["position"] == 1:
+                        _close(price, "CLOSE_LONG", source="agent")
+                    _open(price, -1, source="agent")
+                portfolio["last_action"] = names[action]
+
+            portfolio["action_history"].append({
+                "time":   datetime.utcnow().strftime("%H:%M:%S"),
+                "action": names[action],
+                "price":  round(price, 2),
+                "source": "manual" if portfolio["manual_mode"] else "agent",
+                "tfi":    round(bar["tfi"], 4),
+                "ofi":    round(bar["ofi_norm"], 4),
+            })
 
         except Exception as e:
-            print(f"[Inference] Error: {e}")
+            print(f"[POLL] Error: {e}")
 
-# ── API ENDPOINTS ─────────────────────────────────────────────────────────────
+
+# ── ENDPOINTS ──────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 def health():
+    n = len(feature_buffer)
     return {
         "status":       "running",
         "model_loaded": model is not None,
-        "bars_buffered": len(feature_buffer),
-        "ready":        len(feature_buffer) >= OBS_WINDOW,
+        "bars_buffered":n,
+        "bars_needed":  OBS_WINDOW,
+        "ready":        n >= OBS_WINDOW,
     }
 
 @app.get("/status")
 def status():
-    equity = INITIAL_BALANCE + portfolio["realized_pnl"] + portfolio["unrealized_pnl"]
+    equity = (INITIAL_BALANCE
+              + portfolio["realized_pnl"]
+              + portfolio["unrealized_pnl"])
+    n = len(feature_buffer)
     return {
-        "equity":          round(equity, 2),
-        "realized_pnl":    round(portfolio["realized_pnl"], 4),
-        "unrealized_pnl":  round(portfolio["unrealized_pnl"], 4),
-        "total_return_pct":round((equity / INITIAL_BALANCE - 1) * 100, 4),
-        "position":        portfolio["position"],
-        "entry_price":     round(portfolio["entry_price"], 2),
-        "last_action":     portfolio["last_action"],
-        "last_price":      portfolio["last_price"],
-        "agent_signal":    portfolio["agent_signal"],
-        "manual_mode":     portfolio["manual_mode"],
-        "n_trades":        len(portfolio["trades"]),
-        "equity_history":  portfolio["equity_history"][-120:],
-        "trades":          portfolio["trades"][-20:],
-        "actions":         portfolio["action_history"][-30:],
-        "bars_ready":      len(feature_buffer) >= OBS_WINDOW,
-        "bars_buffered":   len(feature_buffer),
-        "bars_needed":     OBS_WINDOW,
+        "equity":           round(equity, 2),
+        "realized_pnl":     round(portfolio["realized_pnl"],   4),
+        "unrealized_pnl":   round(portfolio["unrealized_pnl"], 4),
+        "total_return_pct": round((equity / INITIAL_BALANCE - 1) * 100, 4),
+        "position":         portfolio["position"],
+        "entry_price":      round(portfolio["entry_price"], 2),
+        "last_action":      portfolio["last_action"],
+        "last_price":       portfolio["last_price"],
+        "agent_signal":     portfolio["agent_signal"],
+        "manual_mode":      portfolio["manual_mode"],
+        "n_trades":         len(portfolio["trades"]),
+        "equity_history":   portfolio["equity_history"][-120:],
+        "trades":           portfolio["trades"][-20:],
+        "actions":          portfolio["action_history"][-30:],
+        "bars_ready":       n >= OBS_WINDOW,
+        "bars_buffered":    n,
+        "bars_needed":      OBS_WINDOW,
     }
 
 @app.get("/chart")
 def chart():
-    """Return OHLCV bars for candlestick chart."""
-    return {
-        "bars":        list(ohlcv_bars),
-        "last_price":  portfolio["last_price"],
-    }
+    return {"bars": list(ohlcv_bars), "last_price": portfolio["last_price"]}
 
 class OrderRequest(BaseModel):
-    side: str   # "BUY", "SELL", "CLOSE"
+    side: str
 
 @app.post("/order")
-def manual_order(req: OrderRequest):
-    """Place a manual demo order. Switches to manual mode."""
+def manual_order(order: OrderRequest):
     price = portfolio["last_price"]
     if price == 0:
-        return {"error": "No price data yet — wait for WebSocket connection"}
-
+        return {"error": "No price yet — wait ~10 seconds"}
     portfolio["manual_mode"] = True
-    side = req.side.upper()
-
+    side = order.side.upper()
     if side == "BUY":
         if portfolio["position"] == -1:
-            _close_position(price, "CLOSE_SHORT", source="manual")
+            _close(price, "CLOSE_SHORT", source="manual")
         if portfolio["position"] == 0:
-            _open_position(price, 1, source="manual")
+            _open(price, 1, source="manual")
             portfolio["last_action"] = "BUY"
-            return {"status": "BUY executed", "price": price}
+            return {"status": "BUY executed", "price": round(price,2)}
         return {"status": "Already long"}
-
     elif side == "SELL":
         if portfolio["position"] == 1:
-            _close_position(price, "CLOSE_LONG", source="manual")
+            _close(price, "CLOSE_LONG", source="manual")
         if portfolio["position"] == 0:
-            _open_position(price, -1, source="manual")
+            _open(price, -1, source="manual")
             portfolio["last_action"] = "SELL"
-            return {"status": "SELL executed", "price": price}
+            return {"status": "SELL executed", "price": round(price,2)}
         return {"status": "Already short"}
-
     elif side == "CLOSE":
         if portfolio["position"] == 0:
             return {"status": "No open position"}
         label = "CLOSE_LONG" if portfolio["position"] == 1 else "CLOSE_SHORT"
-        _close_position(price, label, source="manual")
+        _close(price, label, source="manual")
         portfolio["last_action"] = "CLOSE"
-        return {"status": f"{label} executed", "price": price, "pnl": round(portfolio["realized_pnl"], 4)}
-
+        return {"status": f"{label} executed",
+                "price": round(price,2),
+                "pnl":   round(portfolio["realized_pnl"],4)}
     return {"error": f"Unknown side: {side}"}
 
 @app.post("/toggle_mode")
 def toggle_mode():
-    """Switch between agent-auto and manual mode."""
     portfolio["manual_mode"] = not portfolio["manual_mode"]
-    mode = "MANUAL" if portfolio["manual_mode"] else "AGENT AUTO"
-    return {"mode": mode, "manual_mode": portfolio["manual_mode"]}
+    return {"mode": "MANUAL" if portfolio["manual_mode"] else "AGENT AUTO",
+            "manual_mode": portfolio["manual_mode"]}
 
 @app.post("/reset")
 def reset():
@@ -380,16 +447,13 @@ def reset():
         "realized_pnl": 0.0, "unrealized_pnl": 0.0,
         "trades": [], "equity_history": [INITIAL_BALANCE],
         "action_history": [], "last_action": "HOLD",
-        "last_price": 0.0, "bars_since_trade": 0,
-        "agent_signal": "HOLD", "agent_confidence": 0.0,
-        "manual_mode": False,
+        "last_price": 0.0, "agent_signal": "HOLD",
+        "manual_mode": False, "bars_since_trade": 0,
     })
     feature_buffer.clear()
     ohlcv_bars.clear()
     return {"status": "reset complete"}
 
-# ── STARTUP ───────────────────────────────────────────────────────────────────
+# ── LOCAL RUN ──────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    threading.Thread(target=start_websocket, daemon=True).start()
-    threading.Thread(target=inference_loop, daemon=True).start()
     uvicorn.run(app, host="0.0.0.0", port=8000)
