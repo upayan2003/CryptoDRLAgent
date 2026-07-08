@@ -27,7 +27,7 @@ import uvicorn, requests as req
 from stable_baselines3 import PPO
 
 # ── APP ────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="Crypto RL Agent API", version="3.0")
+app = FastAPI(title="Crypto DRL Agent API", version="3.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
@@ -457,3 +457,77 @@ def reset():
 # ── LOCAL RUN ──────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
+
+# ── ADDITIONAL ENDPOINTS FOR REACT DASHBOARD ──────────────────────────────────
+
+class PauseRequest(BaseModel):
+    paused: bool
+
+@app.post("/agent/pause")
+def agent_pause(req: PauseRequest):
+    """Pause or resume agent inference loop."""
+    portfolio["agent_paused"] = req.paused
+    return {"paused": req.paused, "status": "paused" if req.paused else "running"}
+
+@app.post("/agent/stop")
+def agent_stop():
+    """Stop agent and reset portfolio."""
+    portfolio["agent_paused"] = True
+    return {"status": "stopped"}
+
+class SimRequest(BaseModel):
+    delta_pct: float = 0.0
+    set_price: float = None
+
+@app.post("/market/simulate")
+def market_simulate(req: SimRequest):
+    """
+    Simulate a price move for demo/testing.
+    Injects a synthetic bar into the feature buffer so the agent
+    reacts to the simulated price without real market data.
+    delta_pct: percentage change e.g. 1.0 = +1%, -0.5 = -0.5%
+    set_price: override to exact price value
+    """
+    current = portfolio["last_price"] or 100_000.0
+
+    if req.set_price:
+        new_price = req.set_price
+    else:
+        new_price = current * (1 + req.delta_pct / 100.0)
+
+    # Build a synthetic bar with the simulated price
+    buy_vol  = 1.0 if req.delta_pct > 0 else 0.1
+    sell_vol = 0.1 if req.delta_pct > 0 else 1.0
+
+    prev_p = portfolio["last_price"] or new_price
+    lob = list(lob_buffer)[-1] if lob_buffer else {
+        "bid_price": new_price * 0.9999,
+        "bid_qty":   1.0,
+        "ask_price": new_price * 1.0001,
+        "ask_qty":   1.0,
+    }
+
+    bar = _compute_bar(new_price, prev_p, lob, buy_vol, sell_vol)
+    feature_buffer.append(bar)
+
+    ohlcv_bars.append({
+        "time":  datetime.utcnow().strftime("%H:%M:%S"),
+        "open":  prev_p,
+        "high":  max(prev_p, new_price),
+        "low":   min(prev_p, new_price),
+        "close": new_price,
+        "vol":   10,
+    })
+
+    # Update portfolio price
+    portfolio["last_price"] = new_price
+    update_unrealized(new_price)
+    equity = INITIAL_BALANCE + portfolio["realized_pnl"] + portfolio["unrealized_pnl"]
+    portfolio["equity_history"].append(round(equity, 4))
+
+    return {
+        "status":    "simulated",
+        "new_price": round(new_price, 2),
+        "delta_pct": req.delta_pct,
+    }
