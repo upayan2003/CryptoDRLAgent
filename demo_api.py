@@ -298,7 +298,7 @@ def start_websocket():
     asyncio.run(_run())
 
 # ── INFERENCE LOOP ────────────────────────────────────────────────────────────
-def inference_loop():
+def _inference_loop():
     import requests as req
     global _bar_prices, _bar_start
     prev_price = None
