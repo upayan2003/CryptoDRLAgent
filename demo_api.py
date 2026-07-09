@@ -5,18 +5,22 @@ FastAPI backend for the Crypto RL Agent live demo.
 Supports both autonomous agent trading and manual demo orders.
 
 Endpoints:
-  GET  /health          - server + model status
-  GET  /status          - full portfolio + chart data
-  GET  /chart           - OHLCV bars for candlestick chart
-  POST /order           - place a manual demo order {side: "BUY"|"SELL"|"CLOSE"}
-  POST /reset           - reset entire demo portfolio
-  GET  /agent/signal    - what the agent would do right now
+  GET  /health              - server + model status
+  GET  /status              - full portfolio + chart data
+  GET  /chart               - OHLCV bars for candlestick chart
+  POST /order               - place a manual demo order {side: "BUY"|"SELL"|"CLOSE"}
+  POST /reset               - reset entire demo portfolio
+  GET  /agent/signal        - what the agent would do right now
+  POST /agent/pause         - pause or resume the agent {"paused": true|false}
+  POST /agent/stop          - stop the agent entirely
+  POST /market/simulate     - inject a simulated price {"delta_pct": 1.0} or {"set_price": 95000}
 
 Deploy to Render.com:
   Start command: uvicorn demo_api:app --host 0.0.0.0 --port $PORT
 """
 
 import os, time, threading, asyncio, json
+from typing import Optional
 import numpy as np
 from collections import deque
 from datetime import datetime
@@ -58,16 +62,25 @@ lob_buffer     = deque(maxlen=50)
 trade_buffer   = deque(maxlen=200)
 price_history  = deque(maxlen=500)   # for candlestick
 ohlcv_bars     = deque(maxlen=200)   # 5-second OHLCV bars
-_bar_prices    = []
+_bar_prices    = []                  # accumulates intrabar trade prices from WS
 _bar_start     = time.time()
 
 model = None
+
+# ── AGENT CONTROL STATE ───────────────────────────────────────────────────────
+# FIX: these globals allow the dashboard to pause/stop the inference loop.
+_agent_paused  = False
+_agent_stopped = False
+
+# ── SIMULATION STATE ───────────────────────────────────────────────────────────
+# FIX: allows the dashboard's market simulator to inject synthetic prices.
+_sim_mode          = False
+_sim_price_override = 0.0
 
 # ── MODEL LOAD ────────────────────────────────────────────────────────────────
 @app.on_event("startup")
 def startup():
     global model
-    # Load model
     if os.path.exists(MODEL_PATH):
         model = PPO.load(MODEL_PATH)
         print(f"[API] Model loaded ✓")
@@ -166,6 +179,7 @@ def update_unrealized(price):
     else:
         portfolio["unrealized_pnl"] = 0.0
 
+# ── INFERENCE LOOP ────────────────────────────────────────────────────────────
 def _inference_loop():
     """
     Runs every INFERENCE_EVERY seconds in a background thread.
@@ -173,30 +187,50 @@ def _inference_loop():
     Uses REST polling instead of WebSocket to avoid asyncio conflicts.
     """
     import requests as req
-    global _bar_prices
+    # FIX: _bar_start must also be declared global so it can be reassigned.
+    global _bar_prices, _bar_start
     prev_price = None
 
     print("[POLL] Inference loop started")
 
     while True:
         time.sleep(INFERENCE_EVERY)
+
+        # FIX: respect the pause/stop controls set by the dashboard endpoints.
+        if _agent_stopped:
+            print("[POLL] Agent stopped — exiting loop")
+            break
+        if _agent_paused:
+            continue
+
         try:
-            r     = req.get("https://fapi.binance.com/fapi/v1/ticker/price",
-                            params={"symbol": "BTCUSDT"}, timeout=5)
-            price = float(r.json()["price"])
+            # FIX: honour the market simulator's synthetic price when active.
+            if _sim_mode and _sim_price_override > 0:
+                price = _sim_price_override
+            else:
+                r     = req.get("https://fapi.binance.com/fapi/v1/ticker/price",
+                                params={"symbol": "BTCUSDT"}, timeout=5)
+                price = float(r.json()["price"])
+
             price_history.append({"price": price, "ts": time.time()})
 
-            # Accumulate prices for OHLCV bar
+            # ── OHLCV bar ────────────────────────────────────────────────────
+            # FIX: _bar_prices is also fed by WebSocket aggTrade ticks (see
+            # start_websocket below), so it accumulates real intrabar prices.
+            # Emit one bar per REST poll interval (every INFERENCE_EVERY sec)
+            # and reset the accumulator for the next bar.
             _bar_prices.append(price)
-            ohlcv_bars.append({
-                "time":  datetime.utcnow().strftime("%H:%M:%S"),
-                "open":  _bar_prices[0],
-                "high":  max(_bar_prices),
-                "low":   min(_bar_prices),
-                "close": price,
-                "vol":   len(_bar_prices),
-            })
-            _bar_prices = []
+            if _bar_prices:
+                ohlcv_bars.append({
+                    "time":  datetime.utcnow().strftime("%H:%M:%S"),
+                    "open":  _bar_prices[0],
+                    "high":  max(_bar_prices),
+                    "low":   min(_bar_prices),
+                    "close": _bar_prices[-1],  # last traded price, not always == price
+                    "vol":   len(_bar_prices),
+                })
+                _bar_prices = []
+                _bar_start  = time.time()
 
             if prev_price is None:
                 prev_price = price
@@ -228,17 +262,18 @@ def _inference_loop():
 
             update_unrealized(price)
             portfolio["last_price"] = price
+            portfolio["bars_since_trade"] += 1
             equity = INITIAL_BALANCE + portfolio["realized_pnl"] + portfolio["unrealized_pnl"]
             portfolio["equity_history"].append(round(equity, 4))
 
             if n < OBS_WINDOW or model is None:
                 continue
 
-            obs    = build_observation()
+            obs = build_observation()
             if obs is None:
                 continue
 
-            action, _ = model.predict(obs[np.newaxis, :], deterministic=True)
+            action, _ = model.predict(obs, deterministic=True)
             action     = int(action)
             names      = {0:"HOLD", 1:"BUY", 2:"SELL"}
             portfolio["agent_signal"] = names[action]
@@ -266,17 +301,17 @@ def _inference_loop():
         except Exception as e:
             print(f"[POLL] Error: {e}")
 
-# ── WEBSOCKET ──────────────────────────────────────────────────────────────────
+# ── WEBSOCKET ─────────────────────────────────────────────────────────────────
 def start_websocket():
     async def _run():
         import websockets
-        uri = "wss://stream.binancefuture.com/stream?streams=btcusdt@bookTicker/btcusdt@aggTrade"
+        uri = "wss://fstream.binance.com/stream?streams=btcusdt@bookTicker/btcusdt@aggTrade"
         while True:
             try:
                 async with websockets.connect(uri) as ws:
                     print("[WS] Connected")
                     async for msg in ws:
-                        d = json.loads(msg)
+                        d      = json.loads(msg)
                         stream = d.get("stream", "")
                         data   = d.get("data", {})
                         if "bookTicker" in stream:
@@ -287,147 +322,62 @@ def start_websocket():
                                 "ask_qty":   float(data.get("A", 0)),
                             })
                         elif "aggTrade" in stream:
+                            trade_price = float(data.get("p", 0))
+                            # FIX: feed real trade prices into the bar accumulator
+                            # so each 5-second OHLCV bar reflects intrabar movement
+                            # rather than always being a single-price doji.
+                            if trade_price > 0:
+                                _bar_prices.append(trade_price)
                             trade_buffer.append({
                                 "qty":     float(data.get("q", 0)),
                                 "is_sell": bool(data.get("m", False)),
-                                "price":   float(data.get("p", 0)),
+                                "price":   trade_price,
                             })
             except Exception as e:
                 print(f"[WS] Error: {e} — reconnecting in 3s")
                 await asyncio.sleep(3)
     asyncio.run(_run())
 
-# ── INFERENCE LOOP ────────────────────────────────────────────────────────────
-def _inference_loop():
-    import requests as req
-    global _bar_prices, _bar_start
-    prev_price = None
-
-    while True:
-        time.sleep(INFERENCE_EVERY)
-        try:
-            r     = req.get("https://fapi.binance.com/fapi/v1/ticker/price",
-                            params={"symbol": "BTCUSDT"}, timeout=5)
-            price = float(r.json()["price"])
-            price_history.append({"price": price, "ts": time.time()})
-            _bar_prices.append(price)
-
-            # Build OHLCV bar every 5 seconds
-            if _bar_prices:
-                ohlcv_bars.append({
-                    "time":  datetime.utcnow().strftime("%H:%M:%S"),
-                    "open":  _bar_prices[0],
-                    "high":  max(_bar_prices),
-                    "low":   min(_bar_prices),
-                    "close": _bar_prices[-1],
-                    "vol":   len(_bar_prices),
-                })
-                _bar_prices = []
-
-            if prev_price is None:
-                prev_price = price
-                continue
-
-            recent   = list(trade_buffer)
-            buy_vol  = sum(t["qty"] for t in recent if not t["is_sell"])
-            sell_vol = sum(t["qty"] for t in recent if t["is_sell"])
-            trade_buffer.clear()
-
-            lob = list(lob_buffer)[-1] if lob_buffer else {
-                "bid_price": price*0.9999, "bid_qty": 1.0,
-                "ask_price": price*1.0001, "ask_qty": 1.0,
-            }
-
-            bar = compute_features(price, prev_price,
-                                   lob["bid_price"], lob["bid_qty"],
-                                   lob["ask_price"], lob["ask_qty"],
-                                   buy_vol, sell_vol)
-            feature_buffer.append(bar)
-            prev_price = price
-
-            update_unrealized(price)
-            portfolio["last_price"] = price
-            portfolio["bars_since_trade"] += 1
-
-            equity = INITIAL_BALANCE + portfolio["realized_pnl"] + portfolio["unrealized_pnl"]
-            portfolio["equity_history"].append(round(equity, 4))
-
-            # ── Get agent signal ────────────────────────────────────────────
-            obs = build_observation()
-            if obs is not None and model is not None:
-                action, _ = model.predict(obs[np.newaxis, :], deterministic=True)
-                action = int(action)
-                names  = {0:"HOLD", 1:"BUY", 2:"SELL"}
-                portfolio["agent_signal"] = names[action]
-
-                # Execute if not in manual mode
-                if not portfolio["manual_mode"]:
-                    if action == 1 and portfolio["position"] <= 0:
-                        if portfolio["position"] == -1:
-                            _close_position(price, "CLOSE_SHORT", source="agent")
-                        _open_position(price, 1, source="agent")
-                    elif action == 2 and portfolio["position"] >= 0:
-                        if portfolio["position"] == 1:
-                            _close_position(price, "CLOSE_LONG", source="agent")
-                        _open_position(price, -1, source="agent")
-                    portfolio["last_action"] = names[action]
-
-                portfolio["action_history"].append({
-                    "time":   datetime.utcnow().strftime("%H:%M:%S"),
-                    "action": names[action],
-                    "price":  round(price, 2),
-                    "source": "manual" if portfolio["manual_mode"] else "agent",
-                    "tfi":    round(bar["tfi"], 4),
-                    "ofi":    round(bar["ofi_norm"], 4),
-                })
-
-            print(f"  [{datetime.utcnow().strftime('%H:%M:%S')}]  "
-                  f"price={price:.2f}  signal={portfolio['agent_signal']}  "
-                  f"pos={portfolio['position']}  equity={equity:.2f}")
-
-        except Exception as e:
-            print(f"[Inference] Error: {e}")
-
 # ── API ENDPOINTS ─────────────────────────────────────────────────────────────
 
 @app.get("/health")
 def health():
     return {
-        "status":       "running",
-        "model_loaded": model is not None,
+        "status":        "running",
+        "model_loaded":  model is not None,
         "bars_buffered": len(feature_buffer),
-        "ready":        len(feature_buffer) >= OBS_WINDOW,
+        "ready":         len(feature_buffer) >= OBS_WINDOW,
     }
 
 @app.get("/status")
 def status():
     equity = INITIAL_BALANCE + portfolio["realized_pnl"] + portfolio["unrealized_pnl"]
     return {
-        "equity":          round(equity, 2),
-        "realized_pnl":    round(portfolio["realized_pnl"], 4),
-        "unrealized_pnl":  round(portfolio["unrealized_pnl"], 4),
-        "total_return_pct":round((equity / INITIAL_BALANCE - 1) * 100, 4),
-        "position":        portfolio["position"],
-        "entry_price":     round(portfolio["entry_price"], 2),
-        "last_action":     portfolio["last_action"],
-        "last_price":      portfolio["last_price"],
-        "agent_signal":    portfolio["agent_signal"],
-        "manual_mode":     portfolio["manual_mode"],
-        "n_trades":        len(portfolio["trades"]),
-        "equity_history":  portfolio["equity_history"][-120:],
-        "trades":          portfolio["trades"][-20:],
-        "actions":         portfolio["action_history"][-30:],
-        "bars_ready":      len(feature_buffer) >= OBS_WINDOW,
-        "bars_buffered":   len(feature_buffer),
-        "bars_needed":     OBS_WINDOW,
+        "equity":           round(equity, 2),
+        "realized_pnl":     round(portfolio["realized_pnl"], 4),
+        "unrealized_pnl":   round(portfolio["unrealized_pnl"], 4),
+        "total_return_pct": round((equity / INITIAL_BALANCE - 1) * 100, 4),
+        "position":         portfolio["position"],
+        "entry_price":      round(portfolio["entry_price"], 2),
+        "last_action":      portfolio["last_action"],
+        "last_price":       portfolio["last_price"],
+        "agent_signal":     portfolio["agent_signal"],
+        "manual_mode":      portfolio["manual_mode"],
+        "n_trades":         len(portfolio["trades"]),
+        "equity_history":   portfolio["equity_history"][-120:],
+        "trades":           portfolio["trades"][-20:],
+        "actions":          portfolio["action_history"][-30:],
+        "bars_ready":       len(feature_buffer) >= OBS_WINDOW,
+        "bars_buffered":    len(feature_buffer),
+        "bars_needed":      OBS_WINDOW,
     }
 
 @app.get("/chart")
 def chart():
     """Return OHLCV bars for candlestick chart."""
     return {
-        "bars":        list(ohlcv_bars),
-        "last_price":  portfolio["last_price"],
+        "bars":       list(ohlcv_bars),
+        "last_price": portfolio["last_price"],
     }
 
 class OrderRequest(BaseModel):
@@ -467,7 +417,8 @@ def manual_order(req: OrderRequest):
         label = "CLOSE_LONG" if portfolio["position"] == 1 else "CLOSE_SHORT"
         _close_position(price, label, source="manual")
         portfolio["last_action"] = "CLOSE"
-        return {"status": f"{label} executed", "price": price, "pnl": round(portfolio["realized_pnl"], 4)}
+        return {"status": f"{label} executed", "price": price,
+                "pnl": round(portfolio["realized_pnl"], 4)}
 
     return {"error": f"Unknown side: {side}"}
 
@@ -480,6 +431,7 @@ def toggle_mode():
 
 @app.post("/reset")
 def reset():
+    global _agent_stopped, _agent_paused, _sim_mode, _sim_price_override
     portfolio.update({
         "balance": INITIAL_BALANCE, "position": 0, "entry_price": 0.0,
         "realized_pnl": 0.0, "unrealized_pnl": 0.0,
@@ -491,7 +443,60 @@ def reset():
     })
     feature_buffer.clear()
     ohlcv_bars.clear()
+    _agent_paused       = False
+    _agent_stopped      = False
+    _sim_mode           = False
+    _sim_price_override = 0.0
     return {"status": "reset complete"}
+
+# ── FIX: missing endpoints that the dashboard calls ──────────────────────────
+
+@app.get("/agent/signal")
+def agent_signal():
+    """Return the current agent signal and readiness."""
+    return {
+        "signal":     portfolio["agent_signal"],
+        "confidence": portfolio["agent_confidence"],
+        "ready":      len(feature_buffer) >= OBS_WINDOW,
+        "paused":     _agent_paused,
+        "stopped":    _agent_stopped,
+    }
+
+class PauseRequest(BaseModel):
+    paused: bool
+
+@app.post("/agent/pause")
+def agent_pause(req: PauseRequest):
+    """Pause or resume the inference loop without resetting state."""
+    global _agent_paused
+    _agent_paused = req.paused
+    return {"paused": _agent_paused}
+
+@app.post("/agent/stop")
+def agent_stop():
+    """Stop the inference loop (requires /reset to restart)."""
+    global _agent_stopped
+    _agent_stopped = True
+    return {"stopped": True}
+
+class SimulateRequest(BaseModel):
+    delta_pct: Optional[float] = None   # e.g. 1.0 means +1%
+    set_price: Optional[float] = None   # override to an exact value
+
+@app.post("/market/simulate")
+def simulate_market(req: SimulateRequest):
+    """Inject a synthetic price for demo/testing purposes."""
+    global _sim_mode, _sim_price_override
+    _sim_mode = True
+    current = _sim_price_override if _sim_price_override > 0 else portfolio["last_price"]
+    if req.set_price is not None:
+        _sim_price_override = float(req.set_price)
+    elif req.delta_pct is not None:
+        _sim_price_override = current * (1.0 + req.delta_pct / 100.0)
+    # Immediately update last_price so the UI reflects the change at once
+    if _sim_price_override > 0:
+        portfolio["last_price"] = _sim_price_override
+    return {"status": "simulated", "price": _sim_price_override}
 
 # ── STARTUP ───────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
