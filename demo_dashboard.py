@@ -500,12 +500,6 @@ with chart_col:
                 line=dict(color=PURPLE, width=2),
                 name="Equity", showlegend=True,
             ))
-            fig2.add_hline(
-                y=INITIAL_BAL, line_dash="dot", line_color=GRAY,
-                line_width=1.5,
-                annotation_text="Start $10,000",
-                annotation_font=dict(color=GRAY, size=10),
-            )
             peak = max(eq_hist)
             if peak > INITIAL_BAL:
                 fig2.add_hline(
