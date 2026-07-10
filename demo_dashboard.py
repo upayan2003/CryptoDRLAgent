@@ -560,7 +560,63 @@ with chart_col:
             </table></div>""", unsafe_allow_html=True)
         else:
             st.info("⏳ No signals yet — buffer filling...")
+    
+    # ── TRADE LOG ──────────────────────────────────────────────────────────────────
+    st.markdown(f"""
+    <div class='section-header'>
+    <span style='background:linear-gradient(135deg,{PURPLE},{PINK});
+                -webkit-background-clip:text;-webkit-text-fill-color:transparent;
+                font-size:14px;'>📜</span>
+    Trade Execution Log
+    </div>""", unsafe_allow_html=True)
 
+    if trades:
+        rows_html = ""
+        for t in reversed(trades):
+            pnl_v   = float(t.get("pnl", 0))
+            pnl_str = fmt_pnl(pnl_v) if pnl_v != 0 else "—"
+            pcls    = "pnl-pos" if pnl_v > 0 else ("pnl-neg" if pnl_v < 0 else "pnl-neu")
+            typ     = str(t.get("type",""))
+            tcls    = type_class(typ)
+            src     = str(t.get("source","agent"))
+            scls    = "src-agent" if src == "agent" else "src-manual"
+            pos_v   = t.get("position", 0)
+            pos_lbl = {1:"LONG", -1:"SHORT", 0:"FLAT"}.get(pos_v, str(pos_v))
+            rows_html += f"""
+            <tr>
+            <td>{t.get('time','')}</td>
+            <td class='{tcls}'>{typ}</td>
+            <td>${t.get('price',0):,.2f}</td>
+            <td>{pos_lbl}</td>
+            <td class='{pcls}'>{pnl_str}</td>
+            <td><span class='{scls}'>{src.upper()}</span></td>
+            </tr>"""
+
+        st.markdown(f"""
+        <div style='background:{CARD};border:1.5px solid {LGRAY};border-radius:12px;
+                    overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.05);'>
+        <div style='max-height:480px;overflow-y:auto;'>
+            <table class='trade-table'>
+            <thead><tr>
+                <th>TIME</th>
+                <th>TYPE</th>
+                <th>PRICE</th>
+                <th>POSITION</th>
+                <th>PnL (USD)</th>
+                <th>SOURCE</th>
+            </tr></thead>
+            <tbody>{rows_html}</tbody>
+            </table>
+        </div>
+        </div>""", unsafe_allow_html=True)
+    else:
+        st.markdown(f"""
+        <div style='background:{CARD};border:1.5px solid {LGRAY};border-radius:12px;
+                    padding:40px;text-align:center;color:{GRAY};font-size:13px;'>
+        No trades yet — agent is warming up or market is flat.
+        </div>""", unsafe_allow_html=True)
+
+    st.markdown("<div style='height:20px;'></div>", unsafe_allow_html=True)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONTROL COLUMN
@@ -772,64 +828,6 @@ with ctrl_col:
         st.session_state.market_mode  = "auto"
         st.success("Reset!")
         time.sleep(0.4); st.rerun()
-
-
-# ── TRADE LOG ──────────────────────────────────────────────────────────────────
-st.markdown(f"""
-<div class='section-header'>
-  <span style='background:linear-gradient(135deg,{PURPLE},{PINK});
-               -webkit-background-clip:text;-webkit-text-fill-color:transparent;
-               font-size:14px;'>📜</span>
-  Trade Execution Log
-</div>""", unsafe_allow_html=True)
-
-if trades:
-    rows_html = ""
-    for t in reversed(trades):
-        pnl_v   = float(t.get("pnl", 0))
-        pnl_str = fmt_pnl(pnl_v) if pnl_v != 0 else "—"
-        pcls    = "pnl-pos" if pnl_v > 0 else ("pnl-neg" if pnl_v < 0 else "pnl-neu")
-        typ     = str(t.get("type",""))
-        tcls    = type_class(typ)
-        src     = str(t.get("source","agent"))
-        scls    = "src-agent" if src == "agent" else "src-manual"
-        pos_v   = t.get("position", 0)
-        pos_lbl = {1:"LONG", -1:"SHORT", 0:"FLAT"}.get(pos_v, str(pos_v))
-        rows_html += f"""
-        <tr>
-          <td>{t.get('time','')}</td>
-          <td class='{tcls}'>{typ}</td>
-          <td>${t.get('price',0):,.2f}</td>
-          <td>{pos_lbl}</td>
-          <td class='{pcls}'>{pnl_str}</td>
-          <td><span class='{scls}'>{src.upper()}</span></td>
-        </tr>"""
-
-    st.markdown(f"""
-    <div style='background:{CARD};border:1.5px solid {LGRAY};border-radius:12px;
-                overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.05);'>
-      <div style='max-height:480px;overflow-y:auto;'>
-        <table class='trade-table'>
-          <thead><tr>
-            <th>TIME</th>
-            <th>TYPE</th>
-            <th>PRICE</th>
-            <th>POSITION</th>
-            <th>PnL (USD)</th>
-            <th>SOURCE</th>
-          </tr></thead>
-          <tbody>{rows_html}</tbody>
-        </table>
-      </div>
-    </div>""", unsafe_allow_html=True)
-else:
-    st.markdown(f"""
-    <div style='background:{CARD};border:1.5px solid {LGRAY};border-radius:12px;
-                padding:40px;text-align:center;color:{GRAY};font-size:13px;'>
-      No trades yet — agent is warming up or market is flat.
-    </div>""", unsafe_allow_html=True)
-
-st.markdown("<div style='height:20px;'></div>", unsafe_allow_html=True)
 
 # ── AUTO REFRESH ───────────────────────────────────────────────────────────────
 if st.session_state.agent_state != "stopped":
